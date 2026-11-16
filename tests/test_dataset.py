@@ -48,7 +48,7 @@ def _arrays(V, F, P, psi, cfg, rng):
          "vis": rng.random((len(V), 2)).astype(np.float32)}
     res = grid_stage.run("x", d, cfg)
     assert res.ok, res.reason
-    return {**d, **res.data}
+    return {**d, **res.data, "grid_alpha_cells": np.array(float(cfg["grid"]["splat_alpha_cells"]))}
 
 
 @pytest.fixture(scope="module")
@@ -187,16 +187,30 @@ def test_collate_pads_and_masks(processed, cfg):
     assert b["id"] == ["s0", "s1"] and b["P"].dtype == torch.float64
 
 
-def test_to_device_keeps_float64_on_cpu(processed, cfg):
+def test_to_device_default_keeps_all_per_vertex_tensors_on_cpu(processed, cfg):
+    """Only the grid moves; P/psi/area (float64) and vis/mask/corner_mask/index stay together on CPU so a
+    CPU-side per-vertex loss never mixes devices. The meta device accepts float64, so this runs anywhere."""
     root, df = processed
     b = collate([MoebiusSphereDataset(df, root, "train", cfg, rotate=False)[1]])
-    dev = "mps" if torch.backends.mps.is_available() else "cpu"
-    out = to_device(b, dev)
-    assert out["grid"].device.type == dev and out["P"].device.type == "cpu" and out["P"].dtype == torch.float64
-    cast = to_device(b, dev, float64="cast")
-    assert cast["P"].device.type == dev and cast["P"].dtype == torch.float32
+    out = to_device(b, "meta")
+    assert out["grid"].device.type == "meta"
+    for k in ("P", "area", "psi", "vis", "index", "corner_mask", "mask", "R"):
+        assert out[k].device.type == "cpu", k
+        assert out[k].dtype == b[k].dtype, k
+    assert out["id"] == b["id"]
+
+
+def test_to_device_split_and_cast_modes(processed, cfg):
+    root, df = processed
+    b = collate([MoebiusSphereDataset(df, root, "train", cfg, rotate=False)[1]])
+    split = to_device(b, "meta", per_vertex="split")             # float64 on CPU, everything else moved
+    assert split["P"].device.type == "cpu" and split["P"].dtype == torch.float64
+    assert all(split[k].device.type == "meta" for k in ("grid", "vis", "mask", "corner_mask", "index"))
+    cast = to_device(b, "meta", per_vertex="cast")
+    assert all(v.device.type == "meta" for v in cast.values() if isinstance(v, torch.Tensor))
+    assert cast["P"].dtype == torch.float32 and cast["index"].dtype == torch.int64
     with pytest.raises(ValueError):
-        to_device(b, dev, float64="keep")
+        to_device(b, "meta", per_vertex="keep")
 
 
 # ------------------------------------------------------------------ corner mask
@@ -293,6 +307,32 @@ def test_balanced_sampler_batch_composition(processed, cfg, weights, expect):
     np.testing.assert_allclose(tally / tally.sum(), expect, atol=0.01)
 
 
+@pytest.mark.parametrize("batch_size,weights", [(2, (0.45, 0.45, 0.10)), (7, (0.5, 0.3, 0.2)),
+                                                (3, (0.7, 0.2, 0.1)), (5, (0.05, 0.15, 0.8))])
+def test_balanced_sampler_expected_counts_are_exact(processed, cfg, batch_size, weights):
+    """Mean per-batch count of each group equals batch_size * w (not just the floor plus a share of the
+    remainder). For (2, (0.45, 0.45, 0.10)) proportional-to-remainder drawing without replacement gives
+    about (0.868, 0.868, 0.264) instead of (0.9, 0.9, 0.2)."""
+    root, _ = processed
+    ds = MoebiusSphereDataset(_manifest((300, 300, 300)), root, "train", cfg, rotate=False)
+    s = SourceBalancedSampler(ds, batch_size=batch_size, weights=weights, seed=0)
+    groups = np.array(ds.groups)
+    target = batch_size * np.array(weights)
+    counts = []
+    for epoch in range(int(np.ceil(20000 * batch_size / len(ds)))):   # about 20000 batches
+        s.set_epoch(epoch)
+        for b in s:
+            if len(b) == batch_size:
+                c = np.array([np.sum(groups[b] == g) for g in s.group_names])
+                assert np.all(np.abs(c - target) < 1)
+                counts.append(c)
+    counts = np.array(counts)
+    frac = target - np.floor(target)
+    se = np.sqrt(frac * (1 - frac) / len(counts))              # count = floor + Bernoulli(frac)
+    assert np.all(np.abs(counts.mean(0) - target) <= 5 * se + 1e-12)
+    assert np.all(5 * se < 0.02)                               # tight enough to see the 0.064 bias
+
+
 def test_balanced_sampler_partial_last_batch_and_bad_weights(processed, cfg):
     root, _ = processed
     ds = MoebiusSphereDataset(_manifest((90, 5, 5)), root, "train", cfg, rotate=False)
@@ -372,3 +412,181 @@ def test_unrotated_item_refuses_grid_from_other_psi_estimator(processed, cfg):
     ds = MoebiusSphereDataset(df, root, "train", cfg2, rotate=False, seed=1)
     with pytest.raises(ValueError, match="stored grid was built from 'psi'"):
         ds[0]
+
+
+@pytest.fixture
+def one_file(processed, tmp_path):
+    """Copy of s1 under tmp_path (written per test, so edits do not leak into the module fixture)."""
+    root, _ = processed
+    d = read_processed(root / "s1.npz")
+    d.pop("grid_alpha_cells", None)
+    write_processed(tmp_path / "s1.npz", d)
+    return tmp_path, pd.DataFrame([{"id": "s1", "split": "train"}]), d
+
+
+def test_unrotated_item_refuses_grid_of_other_size(one_file, cfg):
+    root, df, _ = one_file
+    for hw in ({"height": GH // 2}, {"width": GW * 2}):
+        c = copy.deepcopy(cfg)
+        c["grid"].update(hw)
+        with pytest.raises(ValueError, match="stored grid is"):
+            MoebiusSphereDataset(df, root, "train", c, rotate=False)[0]
+    MoebiusSphereDataset(df, root, "train", cfg, rotate=False, stored_splat_alpha_cells=2.0)[0]   # matching size
+
+
+def test_unrotated_item_refuses_stored_splat_width_mismatch(one_file, cfg):
+    root, df, d = one_file
+    write_processed(root / "s1.npz", {**d, "grid_alpha_cells": np.array(2.5)})
+    c = copy.deepcopy(cfg)
+    c["grid"].update(splat_alpha_cells=2.0)
+    with pytest.raises(ValueError, match="splat"):
+        MoebiusSphereDataset(df, root, "train", c, rotate=False)[0]
+    c["grid"].update(splat_alpha_cells=2.5)
+    MoebiusSphereDataset(df, root, "train", c, rotate=False)[0]
+    assert MoebiusSphereDataset(df, root, "train", cfg, rotate=True)[0]["grid"].shape == (7, GH, GW)
+
+
+def test_unrotated_item_without_stored_splat_width_uses_given_value(one_file, cfg):
+    """Files without grid_alpha_cells are checked against ``stored_splat_alpha_cells`` when it is given,
+    and load with one warning per dataset when it is not."""
+    import warnings
+    root, df, _ = one_file
+    c = copy.deepcopy(cfg)
+    c["grid"].update(splat_alpha_cells=3.0)
+    with pytest.raises(ValueError, match="splat"):
+        MoebiusSphereDataset(df, root, "train", c, rotate=False, stored_splat_alpha_cells=2.0)[0]
+    c["grid"].update(splat_alpha_cells=2.0)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        MoebiusSphereDataset(df, root, "train", c, rotate=False, stored_splat_alpha_cells=2.0)[0]
+    ds = MoebiusSphereDataset(df, root, "train", c, rotate=False)
+    with pytest.warns(UserWarning, match="splat") as rec:
+        ds[0]
+        ds[0]
+    assert len([w for w in rec if "splat" in str(w.message)]) == 1
+
+
+# ------------------------------------------------------------------ surface positions
+
+
+@pytest.mark.parametrize("rotate,n_vertices", [(False, None), (True, None), (True, 300)])
+def test_return_surface_follows_indexing_and_rotation(processed, cfg, rotate, n_vertices):
+    root, df = processed
+    ds = MoebiusSphereDataset(df, root, "train", cfg, rotate=rotate, n_vertices=n_vertices, seed=12,
+                              return_surface=True)
+    it = ds[1]
+    V = read_processed(root / "s1.npz")["V"]
+    idx, R = it["index"].numpy(), it["R"].numpy()
+    assert it["V"].dtype == torch.float64 and it["V"].shape == it["P"].shape
+    np.testing.assert_allclose(it["V"].numpy(), V[idx] @ R.T, rtol=0, atol=1e-15)
+    # P and V are the same vertices: the sphere point is the radial projection of the ellipsoid point here
+    np.testing.assert_allclose(it["P"].numpy(), it["V"].numpy() / np.linalg.norm(it["V"].numpy(), axis=1,
+                                                                                  keepdims=True), atol=1e-12)
+
+
+def test_return_surface_collates_with_padding(processed, cfg):
+    root, df = processed
+    ds = MoebiusSphereDataset(df, root, "train", cfg, rotate=False, return_surface=True)
+    a, b = ds[0], ds[1]                                          # 2562 and 642 vertices
+    out = collate([a, b])
+    assert out["V"].shape == (2, 2562, 3) and out["V"].dtype == torch.float64
+    assert torch.equal(out["V"][1, :642], b["V"]) and torch.all(out["V"][1, 642:] == 0)
+    assert to_device(out, "meta")["V"].device.type == "cpu"
+    plain = MoebiusSphereDataset(df, root, "train", cfg, rotate=False)
+    assert "V" not in plain[0] and "V" not in collate([plain[0], plain[1]])
+
+
+# ------------------------------------------------------------------ grid normalisation
+
+
+def _stats(channels, skip=()):
+    """Hand-made channel stats: asinh for K_pt and H, identity for the rest."""
+    per = {}
+    for k, c in enumerate(channels):
+        if c in skip:
+            continue
+        kind = "asinh" if c in ("K_pt", "H") else "identity"
+        per[c] = {"transform": {"kind": kind, "scale": 0.5 + k, "mean": 0.1 * k - 0.2, "std": 1.0 + 0.5 * k}}
+    return {"channels": per}
+
+
+def test_normalize_stats_applies_transform_and_standardisation(processed, cfg, tmp_path):
+    root, df = processed
+    ch = tuple(cfg["grid"]["channels"])
+    stats = _stats(ch)
+    path = tmp_path / "channel_stats.json"
+    path.write_text(__import__("json").dumps(stats))
+    raw = MoebiusSphereDataset(df, root, "train", cfg, rotate=False)[0]["grid"].numpy().astype(np.float64)
+    for src in (stats, path, str(path)):
+        G = MoebiusSphereDataset(df, root, "train", cfg, rotate=False, normalize="stats",
+                                 channel_stats=src)[0]["grid"].numpy()
+        assert G.dtype == np.float32 and G.shape == raw.shape
+        for k, c in enumerate(ch):
+            t = stats["channels"][c]["transform"]
+            x = np.arcsinh(raw[k] / t["scale"]) if t["kind"] == "asinh" else raw[k]
+            np.testing.assert_allclose(G[k], (x - t["mean"]) / t["std"], rtol=1e-6, atol=1e-6)
+    it = MoebiusSphereDataset(df, root, "train", cfg, rotate=True, seed=3, normalize="stats", channel_stats=stats)[0]
+    assert torch.isfinite(it["grid"]).all()
+
+
+def test_normalize_stats_is_off_by_default_and_validates_input(processed, cfg):
+    root, df = processed
+    ch = tuple(cfg["grid"]["channels"])
+    raw = read_processed(root / "s0.npz")["grid"]
+    np.testing.assert_array_equal(MoebiusSphereDataset(df, root, "train", cfg, rotate=False)[0]["grid"].numpy(), raw)
+    with pytest.raises(ValueError, match="channel_stats"):
+        MoebiusSphereDataset(df, root, "train", cfg, normalize="stats")
+    with pytest.raises(ValueError):
+        MoebiusSphereDataset(df, root, "train", cfg, normalize="zscore", channel_stats=_stats(ch))
+    with pytest.raises(KeyError, match="K_pt"):
+        MoebiusSphereDataset(df, root, "train", cfg, normalize="stats", channel_stats=_stats(ch, skip=("K_pt",)))
+    bad = _stats(ch)
+    bad["channels"]["H"]["transform"]["std"] = 0.0
+    with pytest.raises(ValueError, match="std"):
+        MoebiusSphereDataset(df, root, "train", cfg, normalize="stats", channel_stats=bad)
+
+
+def test_apply_transform_asinh_limits():
+    from moe_data.dataset import apply_transform
+    x = np.array([-1e6, -1e-4, 0.0, 1e-4, 1e6])
+    y = apply_transform(x, "asinh", 2.0)
+    np.testing.assert_allclose(y, -y[::-1], rtol=0, atol=0)                       # odd
+    np.testing.assert_allclose(y[1:4], x[1:4] / 2.0, rtol=1e-8)                   # linear near 0
+    np.testing.assert_allclose(y[-1], np.log(2 * 1e6 / 2.0), rtol=1e-10)          # log for |x| >> scale
+    np.testing.assert_array_equal(apply_transform(x, "identity"), x)
+    with pytest.raises(ValueError):
+        apply_transform(x, "log")
+
+
+def test_summarize_values_and_recommend_transform():
+    from moe_data.dataset import apply_transform, recommend_transform, summarize_values
+    rng = np.random.default_rng(13)
+    smooth = rng.normal(1.4, 0.4, 100000)                       # psi-like: identity
+    t = recommend_transform(smooth)
+    assert t["kind"] == "identity" and t["scale"] == 1.0
+    assert t["mean"] == pytest.approx(1.4, abs=0.01) and t["std"] == pytest.approx(0.4, rel=0.02)
+    spiky = rng.standard_cauchy(100000) * 10.0                    # K_pt-like: 6 orders of magnitude
+    t = recommend_transform(spiky)
+    assert t["kind"] == "asinh" and t["scale"] == pytest.approx(10.0, rel=0.05)   # median |Cauchy| = 1
+    y = (apply_transform(spiky, "asinh", t["scale"]) - t["mean"]) / t["std"]
+    assert abs(y.mean()) < 1e-9 and y.std() == pytest.approx(1.0, rel=1e-9) and np.abs(y).max() < 20
+    mostly_zero = np.concatenate([np.zeros(900), rng.uniform(1, 2, 99), [1e5]])
+    t = recommend_transform(mostly_zero)
+    assert t["kind"] == "asinh" and 1 <= t["scale"] <= 2
+    assert recommend_transform(np.zeros(10)) == {"kind": "identity", "scale": 1.0, "mean": 0.0, "std": 1.0}
+    s = summarize_values(np.arange(1001.0))
+    assert s["p50"] == 500.0 and s["p0.1"] == pytest.approx(1.0) and s["p99.9"] == pytest.approx(999.0)
+    assert s["min"] == 0 and s["max"] == 1000 and s["median_abs"] == 500.0
+
+
+def test_normalize_stats_picks_stored_frame_entry_without_rotation(processed, cfg):
+    root, df = processed
+    ch = tuple(cfg["grid"]["channels"])
+    stats = _stats(ch)
+    for c in ch:
+        stats["channels"][c]["transform_stored"] = {"kind": "identity", "scale": 1.0, "mean": 5.0, "std": 2.0}
+    raw = read_processed(root / "s0.npz")["grid"].astype(np.float64)
+    G = MoebiusSphereDataset(df, root, "train", cfg, rotate=False, normalize="stats", channel_stats=stats)[0]["grid"]
+    np.testing.assert_allclose(G.numpy(), (raw - 5.0) / 2.0, rtol=1e-6, atol=1e-6)
+    ds = MoebiusSphereDataset(df, root, "train", cfg, rotate=True, normalize="stats", channel_stats=stats)
+    assert ds.transforms["psi"] == {"kind": "identity", "scale": 0.5, "mean": -0.2, "std": 1.0}

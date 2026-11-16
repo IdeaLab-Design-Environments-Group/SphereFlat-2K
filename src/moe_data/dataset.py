@@ -7,12 +7,14 @@ is not interpolated). ``R`` is returned so a consumer can map back.
 Precision: P, area and psi stay float64 on CPU. MPS has no float64 (moving a float64 tensor to mps
 raises TypeError), so the training loop must either compute the per-vertex loss on CPU or cast only
 *relative* quantities (differences, centred values) to float32 before moving them. ``to_device`` does
-the safe default: float32 tensors go to the device, float64 tensors stay on CPU unless
-``float64="cast"`` is passed.
+the safe default: only the grid goes to the device and every per-vertex tensor stays on CPU
+(``per_vertex="split"`` or ``"cast"`` select the alternatives).
 """
 from __future__ import annotations
 
+import json
 import math
+import warnings
 from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 
@@ -28,7 +30,7 @@ REQUIRED_KEYS = ("V", "F", "P", "area", "area_sphere", "psi", "K_int", "K_pt", "
 _DTYPES = {"V": np.float64, "F": np.int64, "P": np.float64, "area": np.float64, "area_sphere": np.float64,
            "psi": np.float64, "K_int": np.float64, "K_pt": np.float64, "H": np.float64, "vis": np.float32,
            "grid": np.float32}
-PER_VERTEX = ("P", "area", "psi", "vis", "index", "corner_mask")
+PER_VERTEX = ("P", "area", "psi", "vis", "index", "corner_mask", "V")   # V only with return_surface
 SOURCE_GROUPS = ("thingi10k", "proc_blob", "proc_protrusion")
 
 
@@ -87,11 +89,25 @@ class MoebiusSphereDataset(Dataset):
     radius to a sharp input-mesh vertex; all False when the file has no ``corner_dist``), R (3,3) float64,
     id str, source_group str (see ``source_groups``).
 
-    ``corner_radius`` overrides ``cfg['corners']['exclude_radius']``.
+    ``corner_radius`` overrides ``cfg['corners']['exclude_radius']``. ``stored_splat_alpha_cells`` is the
+    splat width the stored grids were built with, checked on the unrotated path when the file does not
+    store ``grid_alpha_cells``.
+
+    ``return_surface=True`` adds V (n,3) float64: the surface vertex positions with the same indexing
+    and subsampling as P, rotated by the same R (so the sample is the shape at R, and surface distances
+    are unchanged).
+
+    ``normalize="stats"`` maps every grid channel through the transform in ``channel_stats`` (a path to
+    the json written by scripts/channel_stats.py, or its parsed dict) and standardises it: see
+    ``normalize_grid``. With rotate=True the mean / std measured on rotated grids (``transform``) are
+    used, with rotate=False those of the stored grids (``transform_stored``). Off by default (``None``):
+    the grid holds the raw channel values.
     """
 
     def __init__(self, manifest_path_or_df, processed_dir, split: str, cfg: dict, rotate: bool = True,
-                 n_vertices: int | None = None, seed: int = 0, corner_radius: float | None = None):
+                 n_vertices: int | None = None, seed: int = 0, corner_radius: float | None = None,
+                 stored_splat_alpha_cells: float | None = None, return_surface: bool = False,
+                 normalize: str | None = None, channel_stats: str | Path | Mapping | None = None):
         df = manifest_path_or_df
         if not isinstance(df, pd.DataFrame):
             df = pd.read_parquet(df)
@@ -104,14 +120,54 @@ class MoebiusSphereDataset(Dataset):
         gc = cfg["grid"]
         self.height, self.width = int(gc["height"]), int(gc["width"])
         self.alpha_cells = float(gc["splat_alpha_cells"])
+        self.stored_alpha_cells = None if stored_splat_alpha_cells is None else float(stored_splat_alpha_cells)
+        self._warned_alpha = False
         self.channels = tuple(gc["channels"])
         self.psi_key = gc["psi_source"]
         self.rotate, self.n_vertices, self.seed = rotate, n_vertices, seed
         self.rng = np.random.default_rng(seed)
         self.corner_radius = float(cfg["corners"]["exclude_radius"] if corner_radius is None else corner_radius)
+        self.return_surface = bool(return_surface)
+        if normalize not in (None, "stats"):
+            raise ValueError(f"normalize must be None or 'stats', got {normalize!r}")
+        self.normalize = normalize
+        self.transforms = None
+        if normalize == "stats":
+            if channel_stats is None:
+                raise ValueError("normalize='stats' needs channel_stats (path or dict)")
+            self.transforms = channel_transforms(channel_stats, self.channels,
+                                                 "transform" if rotate else "transform_stored")
 
     def __len__(self) -> int:
         return len(self.ids)
+
+    def _check_stored_grid(self, sid: str, d: dict) -> None:
+        """Refuse a stored grid built with other channels, size or splat width than the config.
+
+        The splat width is read from ``grid_alpha_cells`` when the file has it. Otherwise it is compared
+        with ``stored_splat_alpha_cells`` (the width the processed files were built with) when that was
+        given, and accepted with one warning per dataset when it was not.
+        """
+        stored = tuple(str(c) for c in d["grid_channels"])
+        if stored != self.channels:
+            raise ValueError(f"{sid}: stored grid channels {stored} != config {self.channels}")
+        if tuple(d["grid"].shape[1:]) != (self.height, self.width):
+            raise ValueError(f"{sid}: stored grid is {tuple(d['grid'].shape[1:])} (H, W) but the config asks "
+                             f"for {(self.height, self.width)}; rebuild the grids or use rotate=True")
+        if "grid_alpha_cells" in d:
+            built, origin = float(d["grid_alpha_cells"]), "file"
+        elif self.stored_alpha_cells is not None:
+            built, origin = self.stored_alpha_cells, "stored_splat_alpha_cells"
+        else:
+            if not self._warned_alpha:
+                warnings.warn(f"{sid}: stored grid has no grid_alpha_cells and no stored_splat_alpha_cells "
+                              "was given; the splat width of the stored grids is not checked",
+                              UserWarning, stacklevel=3)
+                self._warned_alpha = True
+            return
+        if not math.isclose(built, self.alpha_cells, rel_tol=1e-12):
+            raise ValueError(f"{sid}: stored grid splat width {built} ({origin}) != grid.splat_alpha_cells "
+                             f"{self.alpha_cells}; rebuild the grids or use rotate=True")
 
     def __getitem__(self, i: int) -> dict:
         sid = self.ids[i]
@@ -134,9 +190,7 @@ class MoebiusSphereDataset(Dataset):
             P = P @ R.T
         else:
             R = np.eye(3)
-            stored = tuple(str(c) for c in d["grid_channels"])
-            if stored != self.channels:
-                raise ValueError(f"{sid}: stored grid channels {stored} != config {self.channels}")
+            self._check_stored_grid(sid, d)
             G = d["grid"]
         area = d["area"]
         corner = (d["corner_dist"] < self.corner_radius if "corner_dist" in d
@@ -144,7 +198,9 @@ class MoebiusSphereDataset(Dataset):
         idx = np.arange(len(P))
         if self.n_vertices is not None:
             idx, area = area_weighted_subsample(area, self.n_vertices, self.rng)
-        return {"id": sid,
+        if self.transforms is not None:
+            G = normalize_grid(G, self.channels, self.transforms)
+        item = {"id": sid,
                 "grid": torch.from_numpy(np.ascontiguousarray(G, dtype=np.float32)),
                 "P": torch.from_numpy(np.ascontiguousarray(P[idx], dtype=np.float64)),
                 "area": torch.from_numpy(np.ascontiguousarray(area, dtype=np.float64)),
@@ -154,6 +210,92 @@ class MoebiusSphereDataset(Dataset):
                 "corner_mask": torch.from_numpy(np.ascontiguousarray(corner[idx], dtype=bool)),
                 "R": torch.from_numpy(R.astype(np.float64)),
                 "source_group": self.groups[i]}
+        if self.return_surface:
+            item["V"] = torch.from_numpy(np.ascontiguousarray(d["V"][idx] @ R.T, dtype=np.float64))
+        return item
+
+
+TRANSFORMS = ("identity", "asinh")
+
+
+PERCENTILES = (0.1, 1.0, 50.0, 99.0, 99.9)
+ASINH_DYNAMIC_RANGE = 100.0   # max|x| / median|x| above which a channel gets asinh(x / median|x|)
+
+
+def summarize_values(x: np.ndarray) -> dict[str, float]:
+    """min, max, mean, std, median |x| and the ``PERCENTILES`` (keys ``p0.1`` ... ``p99.9``) of x."""
+    x = np.asarray(x, np.float64).ravel()
+    q = np.percentile(x, PERCENTILES)
+    out = {"min": float(x.min()), "max": float(x.max()), "mean": float(x.mean()), "std": float(x.std()),
+           "median_abs": float(np.median(np.abs(x)))}
+    out.update({f"p{p:g}": float(v) for p, v in zip(PERCENTILES, q)})
+    return out
+
+
+def recommend_transform(x: np.ndarray) -> dict:
+    """Transform for one channel's train values plus the mean / std of the transformed values.
+
+    ``asinh`` with scale = median |x| when max|x| / median|x| exceeds ``ASINH_DYNAMIC_RANGE`` (values
+    spanning several orders of magnitude: standardising them directly puts the bulk within a tiny
+    fraction of a unit and the extremes hundreds of std out), else ``identity``. A channel that is
+    zero in more than half of its values uses the median of the non-zero |x| as scale.
+    """
+    x = np.asarray(x, np.float64).ravel()
+    a = np.abs(x)
+    scale = float(np.median(a))
+    if scale == 0.0:
+        nz = a[a > 0]
+        scale = float(np.median(nz)) if len(nz) else 1.0
+    kind = "asinh" if a.max() > ASINH_DYNAMIC_RANGE * scale else "identity"
+    if kind == "identity":
+        scale = 1.0
+    y = apply_transform(x, kind, scale)
+    std = float(y.std())
+    return {"kind": kind, "scale": scale, "mean": float(y.mean()), "std": std if std > 0 else 1.0}
+
+
+def channel_transforms(stats: str | Path | Mapping, channels: Sequence[str],
+                       key: str = "transform") -> dict[str, dict]:
+    """Per-channel ``{"kind", "scale", "mean", "std"}`` from a channel_stats json (path or parsed dict),
+    for exactly ``channels``, taken from entry ``key`` of each channel (``"transform"`` for rotated
+    samples, ``"transform_stored"`` for the stored frame; falls back to ``"transform"`` when a channel
+    has no ``key`` entry). Raises KeyError for a channel the stats do not cover."""
+    if not isinstance(stats, Mapping):
+        stats = json.loads(Path(stats).read_text())
+    per = stats["channels"]
+    missing = [c for c in channels if c not in per]
+    if missing:
+        raise KeyError(f"channel stats have no entry for {missing}")
+    out = {}
+    for c in channels:
+        t = per[c].get(key, per[c]["transform"])
+        if t["kind"] not in TRANSFORMS:
+            raise ValueError(f"{c}: unknown transform {t['kind']!r}")
+        if not (float(t["std"]) > 0 and float(t.get("scale", 1.0)) > 0):
+            raise ValueError(f"{c}: transform needs std > 0 and scale > 0")
+        out[c] = {"kind": t["kind"], "scale": float(t.get("scale", 1.0)), "mean": float(t["mean"]),
+                  "std": float(t["std"])}
+    return out
+
+
+def apply_transform(x: np.ndarray, kind: str, scale: float = 1.0) -> np.ndarray:
+    """``identity``: x; ``asinh``: asinh(x / scale) (linear for |x| << scale, log-like beyond)."""
+    x = np.asarray(x, np.float64)
+    if kind == "identity":
+        return x
+    if kind == "asinh":
+        return np.arcsinh(x / scale)
+    raise ValueError(f"unknown transform {kind!r}")
+
+
+def normalize_grid(G: np.ndarray, channels: Sequence[str], transforms: Mapping[str, Mapping]) -> np.ndarray:
+    """(C,H,W) -> (C,H,W) float64 with channel c mapped to (T_c(x) - mean_c) / std_c, where T_c, mean_c
+    and std_c come from ``channel_transforms`` (mean and std are of T_c(x) over the train grids)."""
+    out = np.empty(G.shape, np.float64)
+    for k, c in enumerate(channels):
+        t = transforms[c]
+        out[k] = (apply_transform(G[k], t["kind"], t["scale"]) - t["mean"]) / t["std"]
+    return out
 
 
 def area_weighted_subsample(area: np.ndarray, n: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
@@ -168,8 +310,8 @@ def area_weighted_subsample(area: np.ndarray, n: int, rng: np.random.Generator) 
 
 
 def collate(batch: list[dict]) -> dict:
-    """Stack grids and R; pad per-vertex tensors to the longest item with zeros (False for corner_mask);
-    ``mask`` (B, n_max) bool marks valid entries."""
+    """Stack grids and R; pad per-vertex tensors (V too when the items have it) to the longest item with
+    zeros (False for corner_mask); ``mask`` (B, n_max) bool marks valid entries."""
     n = [len(b["P"]) for b in batch]
     nmax = max(n)
     out = {"id": [b["id"] for b in batch],
@@ -178,6 +320,8 @@ def collate(batch: list[dict]) -> dict:
            "R": torch.stack([b["R"] for b in batch]),
            "mask": torch.arange(nmax)[None, :] < torch.tensor(n)[:, None]}
     for k in PER_VERTEX:
+        if k not in batch[0]:
+            continue
         x0 = batch[0][k]
         pad = x0.new_zeros((len(batch), nmax) + tuple(x0.shape[1:]))
         for j, b in enumerate(batch):
@@ -191,8 +335,8 @@ class SourceBalancedSampler(Sampler[list[int]]):
 
     ``weights`` (default equal) is a mapping group -> weight or a sequence aligned with ``group_names``
     (``SOURCE_GROUPS`` order for the groups present, then any other groups sorted). Each batch gets
-    floor(b * w_g) items of group g, and the remaining slots go to groups drawn without replacement with
-    probability proportional to the fractional parts, so the expected count is exactly b * w_g. Items
+    floor(b * w_g) items of group g, and the remaining slots go one each to groups chosen by systematic
+    sampling of the fractional parts, so the expected count is exactly b * w_g. Items
     within a group are drawn uniformly with replacement. An epoch has ceil(len(dataset) / batch_size)
     batches and len(dataset) items in total; the draw depends only on (seed, epoch) (``set_epoch``).
     Batches are built in the main process, so it works unchanged with DataLoader workers.
@@ -232,13 +376,23 @@ class SourceBalancedSampler(Sampler[list[int]]):
         return math.ceil(self.n_items / self.batch_size)
 
     def _counts(self, b: int, rng: np.random.Generator) -> np.ndarray:
+        """floor(b * w_g) per group plus one extra slot for group g with probability exactly frac_g.
+
+        The remainder slots are placed by systematic sampling: the fractional parts are laid end to end
+        on [0, rest) (in a random group order) and hit by the points u, u + 1, ..., u + rest - 1 with
+        u ~ U[0, 1). Every interval is shorter than 1, so a group gets at most one extra slot, and it
+        gets one with probability equal to its length.
+        """
         exact = b * self.weights
         counts = np.floor(exact).astype(int)
-        rest = b - counts.sum()
+        rest = int(b - counts.sum())
         if rest:
-            frac = exact - counts
-            extra = rng.choice(len(counts), size=rest, replace=False, p=frac / frac.sum())
-            counts[extra] += 1
+            order = rng.permutation(len(counts))
+            frac = (exact - counts)[order]
+            cum = np.cumsum(frac)
+            cum *= rest / cum[-1]                                  # sum(frac) == rest up to rounding
+            hit = np.searchsorted(cum, rng.random() + np.arange(rest), side="right")
+            counts[order[np.minimum(hit, len(counts) - 1)]] += 1
         return counts
 
     def __iter__(self) -> Iterator[list[int]]:
@@ -312,17 +466,31 @@ def make_loader(ds: MoebiusSphereDataset, batch_size: int, num_workers: int = 0,
     return SphereLoader(DataLoader(ds, batch_sampler=sampler, **common))
 
 
-def to_device(batch: dict, device: str | torch.device, float64: str = "cpu") -> dict:
-    """Move a collated batch. float64 tensors stay on CPU (``float64="cpu"``) or are cast to float32
-    first (``"cast"``; only safe for relative quantities, since float32 has ~7 digits)."""
-    if float64 not in ("cpu", "cast"):
-        raise ValueError("float64 must be 'cpu' or 'cast'")
+def to_device(batch: dict, device: str | torch.device, per_vertex: str = "cpu") -> dict:
+    """Move a collated batch to ``device``. Non-tensor entries are passed through.
+
+    ``per_vertex`` decides where everything except ``grid`` goes:
+
+    - ``"cpu"`` (default): only ``grid`` moves; all other tensors (P, area, psi, V, vis, index, mask,
+      corner_mask, R) stay on CPU with their dtypes, so a per-vertex loss computed on CPU has every
+      operand on one device. Move the network output to CPU (``.cpu().double()``) before the loss.
+    - ``"split"``: float64 tensors stay on CPU, all other tensors (float32/int/bool) move. A loss that
+      combines both groups must move one of them itself.
+    - ``"cast"``: every tensor moves; float64 is cast to float32 first (only safe for relative
+      quantities, since float32 has ~7 digits).
+    """
+    if per_vertex not in ("cpu", "split", "cast"):
+        raise ValueError("per_vertex must be 'cpu', 'split' or 'cast'")
     out = {}
     for k, v in batch.items():
         if not isinstance(v, torch.Tensor):
             out[k] = v
+        elif k == "grid":
+            out[k] = v.to(device)
+        elif per_vertex == "cpu":
+            out[k] = v
         elif v.dtype == torch.float64:
-            out[k] = v.to(device=device, dtype=torch.float32) if float64 == "cast" else v
+            out[k] = v.to(device=device, dtype=torch.float32) if per_vertex == "cast" else v
         else:
             out[k] = v.to(device)
     return out
