@@ -1,0 +1,105 @@
+# Single source of truth for paths, thresholds and seeds.
+# Thresholds marked PROPOSED are placeholders until the user confirms them after the pilot.
+
+seed: 20261116
+
+paths:
+  thingi10k_cache: data/raw/thingi10k
+  work: data/work            # per-stage outputs: data/work/<stage>/<id>.npz | <id>.reject.json
+  processed: data/processed  # final per-shape npz
+  manifest: data/manifest.parquet
+  reports: data/reports
+  spheremap_bin: third_party/MoebiusRegistration/Bin/Linux/SphereMap
+
+run:
+  max_workers: 12
+  pilot_thingi: 100
+  pilot_procedural: 50       # 25 blobs + 25 protrusion shapes
+  spheremap_timeout_s: 900
+  collapse_edge: 1.0e-9            # manifest label: flipped-triangle rejections with a shorter sphere edge are float64 collapse, not folds
+  max_crash_share: 0.2             # stop the run if any stage crashes on more than this share of shapes
+
+procedural:
+  n_blobs: 600
+  n_protrusion: 800              # 800 so the L/r (16,24] hold-out (~150) and the in-range test set (~97) are comparable
+  blob:
+    sh_max_degree: [2, 6]          # random l_max range
+    amplitude: [0.05, 0.35]        # relative radial displacement
+  protrusion:
+    count: [1, 4]
+    length: [0.3, 3.0]             # in units of base-blob radius
+    thickness: [0.08, 0.4]         # capsule radius, units of base radius
+    smooth_k: 0.08                 # smooth-union blend radius
+    max_length_over_radius: 24     # cap per protrusion; sphere edges collapse below 1e-13 from ~25
+  sdf_resolution: 160
+
+topology: {}                       # no tunables: closed, edge/vertex manifold, oriented, 1 component, chi = 2
+
+suitability:                       # PROPOSED
+  min_faces: 500
+  min_compactness: 0.005           # V / A^1.5 (round sphere ~0.0940)
+  min_pca_ratio: 0.02              # smallest / largest PCA extent (plates and needles)
+
+dedup:                             # PROPOSED
+  exact_round_decimals: 5
+  near_threshold: 0.005            # 0.02 chains unrelated shapes into one large group
+
+remesh:
+  target_vertices: 15000
+  min_vertices: 10000
+  max_vertices: 20000
+  iterations: 10
+  max_attempts: 4
+  hausdorff_tol: 0.01              # PROPOSED, relative to bbox diagonal
+
+spheremap:
+  iters: 100
+  step_size: 0.1
+  center_cutoff: 1.0e-10
+
+validate:
+  unit_norm_tol: 1.0e-9
+  min_sphere_edge: 1.0e-13          # shortest sphere edge (chord); an absolute area bound rejects valid compressed tips
+  centering_tol: 1.0e-6
+  coverage_tol: 1.0e-6             # |total spherical area / 4pi - 1|; a double cover gives 1
+
+curvature:
+  gauss_bonnet_tol: 1.0e-6
+
+corners:                           # psi is log-singular at sharp input vertices
+  k_threshold: 0.3                 # |angle defect| (rad) of an input-mesh vertex that counts as a corner
+  exclude_radius: 0.025            # PROPOSED: vertices closer than this (unit-area surface) are "corner" vertices
+
+protrusion:                        # PROPOSED
+  psi_low: -3.0                    # area share with psi below this
+  range_threshold: 15.0           # above the p90 corner-excluded psi range of in-range procedural protrusions (14.9)
+  range_source: psi_nocorner_range # corner-excluded psi range (corner values depend on resolution)
+
+grid:
+  height: 128
+  width: 256
+  splat_alpha_cells: 2.0         # biweight splat support radius in cell heights
+  psi_source: psi_lsq            # edge least-squares psi: 3-5x lower closed-form stretch error than the area-ratio psi
+  channels: [psi, psi_min, K_pt, H, K_int_density, K_int_density_asinh, vertex_density]
+  mass_tol: 1.0e-8               # per-vertex normalised splat: total curvature on the grid equals 4 pi to rounding
+
+visibility:
+  n_view: 2
+  n_paint: 2
+  paint_blobs: [1, 4]
+  paint_diffusion_t: 0.01
+  view_smooth_t: 0.0005           # implicit heat step softening the binary view mask (unit-area mesh)
+  camera_distance: 5.0            # perspective camera at centre + this * bbox radius * d
+  ray_offset_rel: 1.0e-4          # ray origin pushed off the surface by this * bbox radius along the normal (camera_distance must be > 1)
+
+split:
+  # procedural protrusion holdout (split-only keys, so changing them does not regenerate shapes)
+  holdout_by: length_over_radius # hold out max L/r in (16, 24]; generator caps L/r at 24
+  holdout_length_min: 2.4        # holdout_by=length: max length >= this goes to protrusion_test
+  holdout_lr_min: 16             # holdout_by=length_over_radius: max length/thickness > this
+  protrusion_inrange_fraction: 0.15   # in-range (L/r <= 16) procedural protrusion groups -> protrusion_test_inrange
+  min_test_per_source:
+    thingi10k: 100               # move whole train groups to test until at least this many Thingi10K test shapes
+  train: 0.8
+  val: 0.1
+  test: 0.1
