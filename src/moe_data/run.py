@@ -13,6 +13,7 @@ from __future__ import annotations
 import torch  # noqa: F401
 
 import argparse
+import hashlib
 import functools
 import json
 import math
@@ -111,6 +112,13 @@ def add_shape_columns(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
         n_protrusions=df.apply(n_protrusions, axis=1).astype(float))
 
 
+def licence_excluded(cand: dict, cfg: dict) -> bool:
+    """True when the candidate's licence matches one of ``licence.exclude_patterns`` (e.g. NoDerivatives
+    licences, whose terms do not allow sharing modified versions such as these remeshed shapes)."""
+    lic = str(cand.get("licence") or "")
+    return any(p in lic for p in (cfg.get("licence") or {}).get("exclude_patterns", []))
+
+
 def _candidates(cfg: dict, pilot: bool) -> list[tuple[str, dict, list[StageSpec]]]:
     out = [(c["shape_id"], {**c, "source": "thingi10k"}, PHASE_A_THINGI)
            for c in thingi.list_candidates(cfg, pilot)]
@@ -165,17 +173,38 @@ def _chamfer_chunk(pairs: list[tuple[str, str]], work: str, seed: int) -> list[f
     return [dedup.chamfer(_aligned(work, a, seed), _aligned(work, b, seed)) for a, b in pairs]
 
 
-def chamfer_pairs(pairs: list[tuple[str, str]], cfg: dict, work: str, chunk: int = 16) -> list[float]:
+def _chamfer_cache_key(a: str, b: str, keys: dict) -> str:
+    """Cache key of one pair: both ids, their normalize-stage keys and the dedup code version."""
+    return "|".join([a, b, keys.get(a, ""), keys.get(b, ""), _DEDUP_DIGEST])
+
+
+_DEDUP_DIGEST = hashlib.sha256(Path(dedup.__file__).read_bytes()).hexdigest()[:16]
+
+
+def chamfer_pairs(pairs: list[tuple[str, str]], cfg: dict, work: str, keys: dict | None = None,
+                  chunk: int = 16) -> list[float]:
     """Chamfer distance (dedup.chamfer on the normalize outputs) for each id pair, in a process pool.
+
+    Results are cached in ``<work>/dedup_chamfer_cache.json`` under the pair's ids, the two shapes'
+    normalize-stage keys (``keys``: id -> key) and the dedup code version, so reruns only compute new pairs.
     Pairs are chunked in sorted order so a worker reuses the aligned shapes it already holds."""
-    order = sorted(range(len(pairs)), key=lambda k: pairs[k])
-    chunks = [order[i:i + chunk] for i in range(0, len(order), chunk)]
-    out = [math.nan] * len(pairs)
-    with ProcessPoolExecutor(max_workers=cfg["run"]["max_workers"], mp_context=get_context("spawn")) as ex:
-        futs = {ex.submit(_chamfer_chunk, [pairs[k] for k in c], work, cfg["seed"]): c for c in chunks}
-        for f in as_completed(futs):
-            for k, v in zip(futs[f], f.result()):
-                out[k] = v
+    keys = keys or {}
+    cache_path = Path(work) / "dedup_chamfer_cache.json"
+    cache = json.loads(cache_path.read_text()) if cache_path.exists() else {}
+    out = [cache.get(_chamfer_cache_key(a, b, keys), math.nan) for a, b in pairs]
+    todo = [k for k, v in enumerate(out) if math.isnan(v)]
+    if todo:
+        order = sorted(todo, key=lambda k: pairs[k])
+        chunks = [order[i:i + chunk] for i in range(0, len(order), chunk)]
+        with ProcessPoolExecutor(max_workers=cfg["run"]["max_workers"], mp_context=get_context("spawn")) as ex:
+            futs = {ex.submit(_chamfer_chunk, [pairs[k] for k in c], work, cfg["seed"]): c for c in chunks}
+            for f in as_completed(futs):
+                for k, v in zip(futs[f], f.result()):
+                    out[k] = v
+                    cache[_chamfer_cache_key(*pairs[k], keys)] = v
+        tmp = cache_path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(cache))
+        tmp.replace(cache_path)
     return out
 
 
@@ -271,12 +300,18 @@ def main(argv=None) -> None:
     max_crash = cfg["run"]["max_crash_share"]
     cands = _candidates(cfg, args.pilot)
     os.environ["HF_HUB_OFFLINE"] = "1"                        # cache exists from here on
+    excluded = [(s, c) for s, c, _ in cands if licence_excluded(c, cfg)]
+    cands = [x for x in cands if not licence_excluded(x[1], cfg)]
     rows_a = _pool_map(_phase_a, [(s, c, sp, cfg, str(work)) for s, c, sp in cands], cfg, "A")
+    rows_a += [{"id": s, "ok": False, "reject_stage": "licence", "reject_reason": f"licence_excluded: {c['licence']}",
+                "source": c["source"], "licence": c.get("licence"), "redistributable": c.get("redistributable"),
+                "thing_id": c.get("thing_id"), "original_file": c.get("file_path", "")} for s, c in excluded]
 
     check_stage_health(rows_a, max_crash)
     passed = [r for r in rows_a if r["ok"]]
     t0 = time.time()
-    recs = _dedup(passed, cfg, functools.partial(chamfer_pairs, cfg=cfg, work=str(work)))
+    recs = _dedup(passed, cfg, functools.partial(chamfer_pairs, cfg=cfg, work=str(work),
+                                                 keys={r["id"]: r["key"] for r in passed}))
     print(f"[dedup] {len(passed)} shapes, {time.time() - t0:.0f}s", flush=True)
     for r in passed:
         rec = recs[r["id"]]

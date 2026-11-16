@@ -33,6 +33,9 @@ procedural:
     max_length_over_radius: 24     # cap per protrusion; sphere edges collapse below 1e-13 from ~25
   sdf_resolution: 160
 
+licence:
+  exclude_patterns: ["No Derivatives"]   # NoDerivatives licences do not allow sharing modified versions
+
 topology: {}                       # no tunables: closed, edge/vertex manifold, oriented, 1 component, chi = 2
 
 suitability:                       # PROPOSED

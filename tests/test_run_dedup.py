@@ -142,3 +142,27 @@ def test_flipped_rejections_split_into_folds_and_collapse():
     out = classify_sphere_rejections(df, collapse_edge=1e-9)
     assert out["sphere_folded"].tolist() == [True, False, False, False]
     assert out["sphere_collapsed"].tolist() == [False, True, False, False]
+
+
+def test_licence_exclusion_matches_no_derivatives_only():
+    from moe_data.run import licence_excluded
+    cfg = {"licence": {"exclude_patterns": ["No Derivatives"]}}
+    assert licence_excluded({"licence": "Attribution - Non-Commercial - No Derivatives"}, cfg)
+    assert licence_excluded({"licence": "Creative Commons - Attribution - No Derivatives"}, cfg)
+    assert not licence_excluded({"licence": "Creative Commons - Attribution - Non-Commercial"}, cfg)
+    assert not licence_excluded({"licence": "generated"}, cfg)
+    assert not licence_excluded({"licence": "Creative Commons - Attribution"}, {"licence": {"exclude_patterns": []}})
+
+
+def test_chamfer_pairs_reuses_cached_distances(tmp_path):
+    """Cached pair distances are returned without touching the (here absent) normalize outputs."""
+    import json
+    from moe_data.run import _chamfer_cache_key, chamfer_pairs
+    work = tmp_path / "work"
+    (work / "normalize").mkdir(parents=True)
+    keys = {"a": "ka", "b": "kb", "c": "kc"}
+    cache = {_chamfer_cache_key("a", "b", keys): 0.001, _chamfer_cache_key("a", "c", keys): 0.04}
+    (work / "dedup_chamfer_cache.json").write_text(json.dumps(cache))
+    cfg = {"run": {"max_workers": 1}, "seed": 0}
+    out = chamfer_pairs([("a", "b"), ("a", "c")], cfg=cfg, work=str(work), keys=keys)
+    assert out == [0.001, 0.04]
