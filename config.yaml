@@ -42,7 +42,8 @@ suitability:                       # PROPOSED
 
 dedup:                             # PROPOSED
   exact_round_decimals: 5
-  near_threshold: 0.005            # 0.02 chains unrelated shapes into one large group
+  candidate_threshold: 0.02        # descriptor distance below which a Thingi10K pair is Chamfer-tested
+  chamfer_threshold: 0.005         # near duplicate: dedup.chamfer below this (unit-area length)
 
 remesh:
   target_vertices: 15000

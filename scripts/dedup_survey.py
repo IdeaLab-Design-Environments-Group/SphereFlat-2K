@@ -1,5 +1,8 @@
 """Measurement only: phase A (load, topology, suitability, normalize) + shape descriptors on ALL Thingi10K
-files, to choose the near-duplicate threshold from the nearest-neighbour distance distribution.
+files, to choose dedup.candidate_threshold from the nearest-neighbour distance distribution.
+
+Descriptors come from moe_data.dedup.descriptor via run._phase_a (face-order independent D2 histogram from
+dedup.D2_PAIRS pairs); descriptors.npz from an earlier descriptor version is overwritten.
 
 Writes data/reports/survey/phase_a.parquet and descriptors.npz. No remeshing, no sphere maps.
 Usage: uv run python scripts/dedup_survey.py --config config.yaml

@@ -1,7 +1,8 @@
 """Run the dataset pipeline: ``uv run python -m moe_data.run --config config.yaml [--pilot]``.
 
 Phase A (per shape): load -> topology -> suitability -> normalize, then shape descriptors.
-Dedup (whole dataset): exact hash / near descriptor / same thing_id groups.
+Dedup (whole dataset): exact hash / near duplicate (descriptor candidates confirmed by Chamfer distance) /
+same thing_id groups.
 Phase B (per kept shape): remesh -> spheremap -> validate_sphere -> curvature -> ... (PER_SHAPE_B).
 Every stage is cached by content key (see runner.py), so a rerun resumes where it stopped.
 """
@@ -12,7 +13,9 @@ from __future__ import annotations
 import torch  # noqa: F401
 
 import argparse
+import functools
 import json
+import math
 import os
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -90,6 +93,24 @@ def classify_sphere_rejections(df: pd.DataFrame, collapse_edge: float) -> pd.Dat
     return df.assign(sphere_folded=flipped & ~collapsed, sphere_collapsed=collapsed)
 
 
+def n_protrusions(row: pd.Series) -> float:
+    """Protrusion count of a procedural shape from its generator parameters (0 for blobs); NaN otherwise."""
+    p = row.get("load.params_json")
+    if row.get("source") != "procedural" or not isinstance(p, str):
+        return math.nan
+    return float(len(json.loads(p).get("protrusions") or []))
+
+
+def add_shape_columns(df: pd.DataFrame, cfg: dict) -> pd.DataFrame:
+    """Per-shape ``protrusion_qualifies`` (the shape itself meets the protrusion_test criterion; its split
+    still follows its group) and ``n_protrusions``."""
+    if df.empty:
+        return df.assign(protrusion_qualifies=pd.Series(dtype=bool), n_protrusions=pd.Series(dtype=float))
+    return df.assign(
+        protrusion_qualifies=df.apply(lambda r: bool(splits.qualifies_protrusion_test(r, cfg)), axis=1),
+        n_protrusions=df.apply(n_protrusions, axis=1).astype(float))
+
+
 def _candidates(cfg: dict, pilot: bool) -> list[tuple[str, dict, list[StageSpec]]]:
     out = [(c["shape_id"], {**c, "source": "thingi10k"}, PHASE_A_THINGI)
            for c in thingi.list_candidates(cfg, pilot)]
@@ -134,22 +155,52 @@ def _assemble(sid: str, work: str, processed: str, psi_source: str) -> str:
     return str(path)
 
 
-def _dedup(passed: list[dict], cfg: dict) -> dict:
-    """Exact-hash duplicates across all sources; near-duplicates (descriptor distance) only among Thingi10K.
+@functools.lru_cache(maxsize=16)
+def _aligned(work: str, sid: str, seed: int) -> dict:
+    d = load_stage_data(Path(work), "normalize", sid)
+    return dedup.aligned_shape(d["V"], d["F"], np.random.default_rng([seed, 11]))
 
+
+def _chamfer_chunk(pairs: list[tuple[str, str]], work: str, seed: int) -> list[float]:
+    return [dedup.chamfer(_aligned(work, a, seed), _aligned(work, b, seed)) for a, b in pairs]
+
+
+def chamfer_pairs(pairs: list[tuple[str, str]], cfg: dict, work: str, chunk: int = 16) -> list[float]:
+    """Chamfer distance (dedup.chamfer on the normalize outputs) for each id pair, in a process pool.
+    Pairs are chunked in sorted order so a worker reuses the aligned shapes it already holds."""
+    order = sorted(range(len(pairs)), key=lambda k: pairs[k])
+    chunks = [order[i:i + chunk] for i in range(0, len(order), chunk)]
+    out = [math.nan] * len(pairs)
+    with ProcessPoolExecutor(max_workers=cfg["run"]["max_workers"], mp_context=get_context("spawn")) as ex:
+        futs = {ex.submit(_chamfer_chunk, [pairs[k] for k in c], work, cfg["seed"]): c for c in chunks}
+        for f in as_completed(futs):
+            for k, v in zip(futs[f], f.result()):
+                out[k] = v
+    return out
+
+
+def _dedup(passed: list[dict], cfg: dict, chamfer_fn) -> dict:
+    """Exact-hash duplicates across all sources; near-duplicates only among Thingi10K.
+
+    Thingi10K pairs with descriptor distance below ``dedup.candidate_threshold`` are near duplicates when
+    ``chamfer_fn`` (list of id pairs -> Chamfer distances) gives a value below ``dedup.chamfer_threshold``.
     Procedural shapes are drawn from independent parameters, so a descriptor match between two of them is a
     false positive (a 2- and a 3-protrusion shape can be 0.014 apart).
     """
     if not passed:
         return {}
+    dc = cfg["dedup"]
     recs = {}
-    for source, thr in (("thingi10k", cfg["dedup"]["near_threshold"]), ("procedural", -1.0)):
+    for source, thr in (("thingi10k", dc["candidate_threshold"]), ("procedural", -1.0)):
         rows = [r for r in passed if r["source"] == source]
         if rows:
+            def confirm(cand, rows=rows):
+                dist = chamfer_fn([(rows[i]["id"], rows[j]["id"]) for i, j in cand])
+                return np.asarray(dist, dtype=np.float64) < dc["chamfer_threshold"]
             recs.update(dedup.dedup_records(
                 [r["id"] for r in rows], np.array([r["_descriptor"] for r in rows]), [r["_hash"] for r in rows],
                 [r["thing_id"] if source == "thingi10k" else None for r in rows], thr,
-                [r["_n_faces"] for r in rows]))
+                [r["_n_faces"] for r in rows], confirm))
     hashes = {}                                     # exact duplicates across the two sources
     for r in passed:
         hashes.setdefault(r["_hash"], []).append(r["id"])
@@ -210,6 +261,7 @@ def main(argv=None) -> None:
     args = ap.parse_args(argv)
     cfg = load_config(args.config)
     os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("IGL_NUM_THREADS", "1")              # libigl distance queries in the dedup pool workers
     tag = "pilot" if args.pilot else "full"
     work = Path(cfg["paths"]["work"]) / tag
     work.mkdir(parents=True, exist_ok=True)
@@ -223,7 +275,9 @@ def main(argv=None) -> None:
 
     check_stage_health(rows_a, max_crash)
     passed = [r for r in rows_a if r["ok"]]
-    recs = _dedup(passed, cfg)
+    t0 = time.time()
+    recs = _dedup(passed, cfg, functools.partial(chamfer_pairs, cfg=cfg, work=str(work)))
+    print(f"[dedup] {len(passed)} shapes, {time.time() - t0:.0f}s", flush=True)
     for r in passed:
         rec = recs[r["id"]]
         r.update(dup_group=rec["group_id"], dup_group_reason=rec["dup_group_reason"])
@@ -264,6 +318,7 @@ def main(argv=None) -> None:
         manifest.append(r)
     df = pd.DataFrame(manifest)
     df = classify_sphere_rejections(df, cfg["run"]["collapse_edge"])
+    df = add_shape_columns(df, cfg)
     df["split"] = splits.assign_splits(df, cfg)
 
     processed = Path(cfg["paths"]["processed"]) / tag
