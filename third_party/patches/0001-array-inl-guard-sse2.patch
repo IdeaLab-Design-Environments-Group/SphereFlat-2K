@@ -1,0 +1,29 @@
+diff --git a/Include/Misha/Array.inl b/Include/Misha/Array.inl
+index edde49b..67cacda 100644
+--- a/Include/Misha/Array.inl
++++ b/Include/Misha/Array.inl
+@@ -28,7 +28,9 @@ DAMAGE.
+ #define FULL_ARRAY_DEBUG    0	// Note that this is not thread-safe
+ 
+ #include <stdio.h>
++#if defined(__SSE2__)
+ #include <emmintrin.h>
++#endif // __SSE2__
+ #include <vector>
+ #ifdef _WIN32
+ #include <windows.h>
+@@ -44,12 +46,14 @@ template< >         inline bool IsValid< float >( const float& f ) { return isfi
+ #else // !_DEBUG
+ template< >         inline bool IsValid< float >( const float& f ) { return isfinitef( f ); }
+ #endif // _DEBUG
++#if defined(__SSE2__)
+ template< >         inline bool IsValid< __m128 >( const __m128& m )
+ {
+ 	const __m128* addr = &m;
+ 	if( size_t(addr) & 15 ) return false;
+ 	else                    return true;
+ }
++#endif // __SSE2__
+ template< class C > inline bool IsValid( const C& c ){ return true; }
+ 
+ 
